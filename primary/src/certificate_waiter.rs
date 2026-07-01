@@ -1,9 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
 use crate::messages::Certificate;
+use crypto::Hash as _;
+use crypto::PublicKey;
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
+use lifecycle_trace::Event;
 use log::error;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -11,6 +14,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 /// Waits to receive all the ancestors of a certificate before looping it back to the `Core`
 /// for further processing.
 pub struct CertificateWaiter {
+    /// The public key of this primary.
+    name: PublicKey,
     /// The persistent storage.
     store: Store,
     /// Receives sync commands from the `Synchronizer`.
@@ -21,12 +26,14 @@ pub struct CertificateWaiter {
 
 impl CertificateWaiter {
     pub fn spawn(
+        name: PublicKey,
         store: Store,
         rx_synchronizer: Receiver<Certificate>,
         tx_core: Sender<Certificate>,
     ) {
         tokio::spawn(async move {
             Self {
+                name,
                 store,
                 rx_synchronizer,
                 tx_core,
@@ -73,6 +80,19 @@ impl CertificateWaiter {
                 }
                 Some(result) = waiting.next() => match result {
                     Ok(certificate) => {
+                        if lifecycle_trace::enabled() {
+                            lifecycle_trace::write(
+                                Event::new("primary", "RepairWaiterCleared")
+                                    .str("source", "primary_certificate_waiter")
+                                    .str("node", format!("{:?}", self.name))
+                                    .str("reason", "missing_ancestor")
+                                    .str("clear_reason", "resolved")
+                                    .str("certificate_digest", format!("{:?}", certificate.digest()))
+                                    .str("header_digest", format!("{:?}", certificate.header.id))
+                                    .u64("round", certificate.round())
+                                    .str("author", format!("{:?}", certificate.origin())),
+                            );
+                        }
                         self.tx_core.send(certificate).await.expect("Failed to send certificate");
                     },
                     Err(e) => {

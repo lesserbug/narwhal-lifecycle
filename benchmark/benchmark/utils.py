@@ -44,6 +44,29 @@ class PathMaker:
         return 'logs'
 
     @staticmethod
+    def lifecycle_logs_path():
+        return join(PathMaker.logs_path(), 'lifecycle')
+
+    @staticmethod
+    def shadow_path():
+        return join(PathMaker.logs_path(), 'shadow')
+
+    @staticmethod
+    def lifecycle_primary_trace_file(i):
+        assert isinstance(i, int) and i >= 0
+        return join(PathMaker.lifecycle_logs_path(), f'primary-{i}.jsonl')
+
+    @staticmethod
+    def lifecycle_worker_trace_file(i, j):
+        assert isinstance(i, int) and i >= 0
+        assert isinstance(j, int) and i >= 0
+        return join(PathMaker.lifecycle_logs_path(), f'worker-{i}-{j}.jsonl')
+
+    @staticmethod
+    def shadow_script_path():
+        return join('..', 'analysis', 'shadow_lifecycle.py')
+
+    @staticmethod
     def primary_log_file(i):
         assert isinstance(i, int) and i >= 0
         return join(PathMaker.logs_path(), f'primary-{i}.log')

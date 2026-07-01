@@ -5,6 +5,7 @@ use crate::messages::{Certificate, Header};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
+use lifecycle_trace::Event;
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::Sender;
@@ -126,6 +127,19 @@ impl Synchronizer {
             }
 
             if self.store.read(digest.to_vec()).await?.is_none() {
+                if lifecycle_trace::enabled() {
+                    lifecycle_trace::write(
+                        Event::new("primary", "RepairWaiterAdded")
+                            .str("source", "primary_synchronizer")
+                            .str("node", format!("{:?}", self.name))
+                            .str("reason", "missing_ancestor")
+                            .str("missing_digest", format!("{:?}", digest))
+                            .str("certificate_digest", format!("{:?}", certificate.digest()))
+                            .str("header_digest", format!("{:?}", certificate.header.id))
+                            .u64("round", certificate.round())
+                            .str("author", format!("{:?}", certificate.origin())),
+                    );
+                }
                 self.tx_certificate_waiter
                     .send(certificate.clone())
                     .await

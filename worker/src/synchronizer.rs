@@ -5,6 +5,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
+use lifecycle_trace::Event;
 use log::{debug, error};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
@@ -122,10 +123,12 @@ impl Synchronizer {
                             }
 
                             // Check if we received the batch in the meantime.
+                            let mut needs_sync = false;
                             match self.store.read(digest.to_vec()).await {
                                 Ok(None) => {
                                     missing.push(digest.clone());
                                     debug!("Requesting sync for batch {}", digest);
+                                    needs_sync = true;
                                 },
                                 Ok(Some(_)) => {
                                     // The batch arrived in the meantime: no need to request it.
@@ -141,6 +144,17 @@ impl Synchronizer {
                             let (tx_cancel, rx_cancel) = channel(1);
                             let fut = Self::waiter(digest.clone(), self.store.clone(), deliver, rx_cancel);
                             waiting.push(fut);
+                            if needs_sync && lifecycle_trace::enabled() {
+                                lifecycle_trace::write(
+                                    Event::new("worker", "RepairWaiterAdded")
+                                        .str("source", "worker_synchronizer")
+                                        .str("node", format!("{:?}", self.name))
+                                        .u64("worker_id", self.id as u64)
+                                        .str("reason", "worker_sync")
+                                        .str("missing_digest", format!("{:?}", digest))
+                                        .u64("round", self.round),
+                                );
+                            }
                             self.pending.insert(digest, (self.round, tx_cancel, now));
                         }
 
@@ -160,6 +174,17 @@ impl Synchronizer {
                     PrimaryWorkerMessage::Cleanup(round) => {
                         // Keep track of the primary's round number.
                         self.round = round;
+                        if lifecycle_trace::enabled() {
+                            lifecycle_trace::write(
+                                Event::new("worker", "CleanupAdvanced")
+                                    .str("source", "worker_cleanup")
+                                    .str("node", format!("{:?}", self.name))
+                                    .u64("worker_id", self.id as u64)
+                                    .u64("committed_round", round)
+                                    .u64("cleanup_round", round.saturating_sub(self.gc_depth))
+                                    .u64("gc_depth", self.gc_depth),
+                            );
+                        }
 
                         // Cleanup internal state.
                         if self.round < self.gc_depth {
@@ -167,8 +192,20 @@ impl Synchronizer {
                         }
 
                         let mut gc_round = self.round - self.gc_depth;
-                        for (r, handler, _) in self.pending.values() {
+                        for (digest, (r, handler, _)) in &self.pending {
                             if r <= &gc_round {
+                                if lifecycle_trace::enabled() {
+                                    lifecycle_trace::write(
+                                        Event::new("worker", "RepairWaiterCleared")
+                                            .str("source", "worker_synchronizer")
+                                            .str("node", format!("{:?}", self.name))
+                                            .u64("worker_id", self.id as u64)
+                                            .str("reason", "worker_sync")
+                                            .str("clear_reason", "cleanup_cancelled")
+                                            .str("missing_digest", format!("{:?}", digest))
+                                            .u64("round", *r),
+                                    );
+                                }
                                 let _ = handler.send(()).await;
                             }
                         }
@@ -180,7 +217,20 @@ impl Synchronizer {
                 Some(result) = waiting.next() => match result {
                     Ok(Some(digest)) => {
                         // We got the batch, remove it from the pending list.
-                        self.pending.remove(&digest);
+                        if let Some((round, _, _)) = self.pending.remove(&digest) {
+                            if lifecycle_trace::enabled() {
+                                lifecycle_trace::write(
+                                    Event::new("worker", "RepairWaiterCleared")
+                                        .str("source", "worker_synchronizer")
+                                        .str("node", format!("{:?}", self.name))
+                                        .u64("worker_id", self.id as u64)
+                                        .str("reason", "worker_sync")
+                                        .str("clear_reason", "resolved")
+                                        .str("missing_digest", format!("{:?}", digest))
+                                        .u64("round", round),
+                                );
+                            }
+                        }
                     },
                     Ok(None) => {
                         // The sync request for this batch has been canceled.
@@ -203,6 +253,16 @@ impl Synchronizer {
                         if timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting sync for batch {} (retry)", digest);
                             retry.push(digest.clone());
+                            if lifecycle_trace::enabled() {
+                                lifecycle_trace::write(
+                                    Event::new("worker", "RepairWaiterRetried")
+                                        .str("source", "worker_synchronizer")
+                                        .str("node", format!("{:?}", self.name))
+                                        .u64("worker_id", self.id as u64)
+                                        .str("reason", "worker_sync")
+                                        .str("missing_digest", format!("{:?}", digest)),
+                                );
+                            }
                         }
                     }
                     if !retry.is_empty() {

@@ -23,6 +23,7 @@ crypto = { path = "../crypto" }
 store = { path = "../store" }
 config = { path = "../config" }
 network = { path = "../network" }
+lifecycle-trace = { path = "../lifecycle-trace" }
 
 [dev-dependencies]
 rand = "0.7.3"

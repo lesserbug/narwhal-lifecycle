@@ -8,6 +8,7 @@ use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
+use lifecycle_trace::Event;
 use log::{debug, error};
 use network::SimpleSender;
 use std::collections::HashMap;
@@ -149,17 +150,34 @@ impl HeaderWaiter {
                                 })
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (round, tx_cancel));
+                            self.pending.insert(header_id.clone(), (round, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 
                             // Ensure we didn't already send a sync request for these parents.
                             let mut requires_sync = HashMap::new();
                             for (digest, worker_id) in missing.into_iter() {
-                                self.batch_requests.entry(digest.clone()).or_insert_with(|| {
-                                    requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
-                                    round
-                                });
+                                if self.batch_requests.contains_key(&digest) {
+                                    continue;
+                                }
+                                requires_sync
+                                    .entry(worker_id)
+                                    .or_insert_with(Vec::new)
+                                    .push(digest.clone());
+                                self.batch_requests.insert(digest.clone(), round);
+                                if lifecycle_trace::enabled() {
+                                    lifecycle_trace::write(
+                                        Event::new("primary", "RepairWaiterAdded")
+                                            .str("source", "primary_header_waiter")
+                                            .str("node", format!("{:?}", self.name))
+                                            .str("reason", "missing_batch")
+                                            .str("missing_digest", format!("{:?}", digest))
+                                            .u64("worker_id", worker_id as u64)
+                                            .str("related_header_digest", format!("{:?}", header_id))
+                                            .u64("round", round)
+                                            .str("author", format!("{:?}", author)),
+                                    );
+                                }
                             }
                             for (worker_id, digests) in requires_sync {
                                 let address = self.committee
@@ -192,7 +210,7 @@ impl HeaderWaiter {
                                 .map(|x| (x.to_vec(), self.store.clone()))
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (round, tx_cancel));
+                            self.pending.insert(header_id.clone(), (round, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 
@@ -205,10 +223,23 @@ impl HeaderWaiter {
                                 .as_millis();
                             let mut requires_sync = Vec::new();
                             for missing in missing {
-                                self.parent_requests.entry(missing.clone()).or_insert_with(|| {
-                                    requires_sync.push(missing);
-                                    (round, now)
-                                });
+                                if self.parent_requests.contains_key(&missing) {
+                                    continue;
+                                }
+                                requires_sync.push(missing.clone());
+                                self.parent_requests.insert(missing.clone(), (round, now));
+                                if lifecycle_trace::enabled() {
+                                    lifecycle_trace::write(
+                                        Event::new("primary", "RepairWaiterAdded")
+                                            .str("source", "primary_header_waiter")
+                                            .str("node", format!("{:?}", self.name))
+                                            .str("reason", "missing_parent")
+                                            .str("missing_digest", format!("{:?}", missing))
+                                            .str("related_header_digest", format!("{:?}", header_id))
+                                            .u64("round", round)
+                                            .str("author", format!("{:?}", author)),
+                                    );
+                                }
                             }
                             if !requires_sync.is_empty() {
                                 let address = self.committee
@@ -227,10 +258,34 @@ impl HeaderWaiter {
                     Ok(Some(header)) => {
                         let _ = self.pending.remove(&header.id);
                         for x in header.payload.keys() {
-                            let _ = self.batch_requests.remove(x);
+                            if self.batch_requests.remove(x).is_some() && lifecycle_trace::enabled() {
+                                lifecycle_trace::write(
+                                    Event::new("primary", "RepairWaiterCleared")
+                                        .str("source", "primary_header_waiter")
+                                        .str("node", format!("{:?}", self.name))
+                                        .str("reason", "missing_batch")
+                                        .str("clear_reason", "resolved")
+                                        .str("missing_digest", format!("{:?}", x))
+                                        .str("related_header_digest", format!("{:?}", header.id))
+                                        .u64("round", header.round)
+                                        .str("author", format!("{:?}", header.author)),
+                                );
+                            }
                         }
                         for x in &header.parents {
-                            let _ = self.parent_requests.remove(x);
+                            if self.parent_requests.remove(x).is_some() && lifecycle_trace::enabled() {
+                                lifecycle_trace::write(
+                                    Event::new("primary", "RepairWaiterCleared")
+                                        .str("source", "primary_header_waiter")
+                                        .str("node", format!("{:?}", self.name))
+                                        .str("reason", "missing_parent")
+                                        .str("clear_reason", "resolved")
+                                        .str("missing_digest", format!("{:?}", x))
+                                        .str("related_header_digest", format!("{:?}", header.id))
+                                        .u64("round", header.round)
+                                        .str("author", format!("{:?}", header.author)),
+                                );
+                            }
                         }
                         self.tx_core.send(header).await.expect("Failed to send header");
                     },
@@ -257,6 +312,15 @@ impl HeaderWaiter {
                         if timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting sync for certificate {} (retry)", digest);
                             retry.push(digest.clone());
+                            if lifecycle_trace::enabled() {
+                                lifecycle_trace::write(
+                                    Event::new("primary", "RepairWaiterRetried")
+                                        .str("source", "primary_header_waiter")
+                                        .str("node", format!("{:?}", self.name))
+                                        .str("reason", "missing_parent")
+                                        .str("missing_digest", format!("{:?}", digest)),
+                                );
+                            }
                         }
                     }
 
@@ -279,6 +343,34 @@ impl HeaderWaiter {
             if round > self.gc_depth {
                 let mut gc_round = round - self.gc_depth;
 
+                if lifecycle_trace::enabled() {
+                    for (digest, r) in &self.batch_requests {
+                        if r <= &gc_round {
+                            lifecycle_trace::write(
+                                Event::new("primary", "RepairWaiterCleared")
+                                    .str("source", "primary_header_waiter")
+                                    .str("node", format!("{:?}", self.name))
+                                    .str("reason", "missing_batch")
+                                    .str("clear_reason", "cleanup_cancelled")
+                                    .str("missing_digest", format!("{:?}", digest))
+                                    .u64("round", *r),
+                            );
+                        }
+                    }
+                    for (digest, (r, _)) in &self.parent_requests {
+                        if r <= &gc_round {
+                            lifecycle_trace::write(
+                                Event::new("primary", "RepairWaiterCleared")
+                                    .str("source", "primary_header_waiter")
+                                    .str("node", format!("{:?}", self.name))
+                                    .str("reason", "missing_parent")
+                                    .str("clear_reason", "cleanup_cancelled")
+                                    .str("missing_digest", format!("{:?}", digest))
+                                    .u64("round", *r),
+                            );
+                        }
+                    }
+                }
                 for (r, handler) in self.pending.values() {
                     if r <= &gc_round {
                         let _ = handler.send(()).await;

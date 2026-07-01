@@ -14,7 +14,12 @@ class CommandMaker:
 
     @staticmethod
     def clean_logs():
-        return f'rm -r {PathMaker.logs_path()} ; mkdir -p {PathMaker.logs_path()}'
+        return (
+            f'rm -r {PathMaker.logs_path()} ; '
+            f'mkdir -p {PathMaker.logs_path()} '
+            f'{PathMaker.lifecycle_logs_path()} '
+            f'{PathMaker.shadow_path()}'
+        )
 
     @staticmethod
     def compile():

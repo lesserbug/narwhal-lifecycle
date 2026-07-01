@@ -4,6 +4,7 @@ use config::WorkerId;
 use crypto::Digest;
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
+use lifecycle_trace::Event;
 use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
 use store::Store;
@@ -34,11 +35,29 @@ impl Processor {
     ) {
         tokio::spawn(async move {
             while let Some(batch) = rx_batch.recv().await {
+                let batch_size = batch.len();
+
                 // Hash the batch.
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
 
                 // Store the batch.
                 store.write(digest.to_vec(), batch).await;
+                if lifecycle_trace::enabled() {
+                    lifecycle_trace::write(
+                        Event::new("worker", "BatchWriteSubmitted")
+                            .str(
+                                "source",
+                                if own_digest {
+                                    "own_batch"
+                                } else {
+                                    "other_batch"
+                                },
+                            )
+                            .u64("worker_id", id as u64)
+                            .str("digest", format!("{:?}", digest))
+                            .usize("batch_size_bytes", batch_size),
+                    );
+                }
 
                 // Deliver the batch's digest.
                 let message = match own_digest {

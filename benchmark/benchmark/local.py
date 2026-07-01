@@ -1,7 +1,10 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 import subprocess
+import sys
+from glob import glob
 from math import ceil
 from os.path import basename, splitext
+from shlex import quote
 from time import sleep
 
 from benchmark.commands import CommandMaker
@@ -29,10 +32,35 @@ class LocalBench:
     def __getattr__(self, attr):
         return getattr(self.bench_parameters, attr)
 
-    def _background_run(self, command, log_file):
+    def _background_run(self, command, log_file, env=None):
         name = splitext(basename(log_file))[0]
-        cmd = f"{command} 2> {log_file}"
+        env = env or {}
+        env_prefix = ''.join(f'{key}={quote(value)} ' for key, value in env.items())
+        cmd = f"{env_prefix}{command} 2> {log_file}"
         subprocess.run(["tmux", "new", "-d", "-s", name, cmd], check=True)
+
+    def _run_shadow_analysis(self):
+        traces = sorted(glob(f'{PathMaker.lifecycle_logs_path()}/*.jsonl'))
+        if not traces:
+            Print.warn('No lifecycle traces found; skipping shadow lifecycle analysis')
+            return
+
+        cmd = [
+            sys.executable,
+            PathMaker.shadow_script_path(),
+            '--trace',
+            *traces,
+            '--out-dir',
+            PathMaker.shadow_path(),
+            '--execution',
+            'slow',
+            '--checkpoint-every',
+            '100',
+            '--plots',
+        ]
+        subprocess.run(cmd, check=True)
+        Print.info(f'Lifecycle traces written to {PathMaker.lifecycle_logs_path()}')
+        Print.info(f'Shadow lifecycle results written to {PathMaker.shadow_path()}')
 
     def _kill_nodes(self):
         try:
@@ -103,7 +131,13 @@ class LocalBench:
                     debug=debug,
                 )
                 log_file = PathMaker.primary_log_file(i)
-                self._background_run(cmd, log_file)
+                self._background_run(
+                    cmd,
+                    log_file,
+                    env={
+                        'NARWHAL_LIFECYCLE_TRACE': PathMaker.lifecycle_primary_trace_file(i),
+                    },
+                )
 
             # Run the workers (except the faulty ones).
             for i, addresses in enumerate(workers_addresses):
@@ -117,12 +151,22 @@ class LocalBench:
                         debug=debug,
                     )
                     log_file = PathMaker.worker_log_file(i, id)
-                    self._background_run(cmd, log_file)
+                    self._background_run(
+                        cmd,
+                        log_file,
+                        env={
+                            'NARWHAL_LIFECYCLE_TRACE': PathMaker.lifecycle_worker_trace_file(i, id),
+                        },
+                    )
 
             # Wait for all transactions to be processed.
             Print.info(f"Running benchmark ({self.duration} sec)...")
             sleep(self.duration)
             self._kill_nodes()
+
+            # Build the offline shadow lifecycle view from passive traces.
+            Print.info("Analyzing lifecycle traces...")
+            self._run_shadow_analysis()
 
             # Parse logs and return the parser.
             Print.info("Parsing logs...")

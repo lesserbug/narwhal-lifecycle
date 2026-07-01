@@ -14,6 +14,10 @@ use tokio::sync::mpsc::Receiver;
 pub struct GarbageCollector {
     /// The current consensus round (used for cleanup).
     consensus_round: Arc<AtomicU64>,
+    /// The public key of this primary.
+    name: PublicKey,
+    /// The depth of the garbage collector.
+    gc_depth: u64,
     /// Receives the ordered certificates from consensus.
     rx_consensus: Receiver<Certificate>,
     /// The network addresses of our workers.
@@ -27,10 +31,12 @@ impl GarbageCollector {
         name: &PublicKey,
         committee: &Committee,
         consensus_round: Arc<AtomicU64>,
+        gc_depth: u64,
         rx_consensus: Receiver<Certificate>,
     ) {
+        let name = *name;
         let addresses = committee
-            .our_workers(name)
+            .our_workers(&name)
             .expect("Our public key or worker id is not in the committee")
             .iter()
             .map(|x| x.primary_to_worker)
@@ -39,6 +45,8 @@ impl GarbageCollector {
         tokio::spawn(async move {
             Self {
                 consensus_round,
+                name,
+                gc_depth,
                 rx_consensus,
                 addresses,
                 network: SimpleSender::new(),
@@ -59,6 +67,16 @@ impl GarbageCollector {
 
                 // Trigger cleanup on the primary.
                 self.consensus_round.store(round, Ordering::Relaxed);
+                if lifecycle_trace::enabled() {
+                    lifecycle_trace::write(
+                        lifecycle_trace::Event::new("primary", "CleanupAdvanced")
+                            .str("source", "primary_gc")
+                            .str("node", format!("{:?}", self.name))
+                            .u64("committed_round", round)
+                            .u64("cleanup_round", round.saturating_sub(self.gc_depth))
+                            .u64("gc_depth", self.gc_depth),
+                    );
+                }
 
                 // Trigger cleanup on the workers..
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))

@@ -2,6 +2,7 @@
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
+use lifecycle_trace::Event;
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use std::cmp::max;
@@ -179,6 +180,35 @@ impl Consensus {
 
             // Output the sequence in the right order.
             for certificate in sequence {
+                if lifecycle_trace::enabled() {
+                    lifecycle_trace::write(
+                        Event::new("consensus", "CertificateCommitted")
+                            .str("source", "consensus_output")
+                            .str("certificate_digest", format!("{:?}", certificate.digest()))
+                            .str("header_digest", format!("{:?}", certificate.header.id))
+                            .u64("round", certificate.round())
+                            .str("author", format!("{:?}", certificate.origin()))
+                            .str_array(
+                                "payload_digests",
+                                certificate
+                                    .header
+                                    .payload
+                                    .keys()
+                                    .map(|x| format!("{:?}", x))
+                                    .collect(),
+                            )
+                            .str_array(
+                                "parents",
+                                certificate
+                                    .header
+                                    .parents
+                                    .iter()
+                                    .map(|x| format!("{:?}", x))
+                                    .collect(),
+                            ),
+                    );
+                }
+
                 #[cfg(not(feature = "benchmark"))]
                 info!("Committed {}", certificate.header);
 

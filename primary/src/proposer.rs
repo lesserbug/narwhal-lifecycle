@@ -4,6 +4,7 @@ use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
+use lifecycle_trace::Event;
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
@@ -89,6 +90,20 @@ impl Proposer {
         )
         .await;
         debug!("Created {:?}", header);
+        if lifecycle_trace::enabled() {
+            for (digest, worker_id) in &header.payload {
+                lifecycle_trace::write(
+                    Event::new("primary", "PayloadReferenced")
+                        .str("source", "proposer_created")
+                        .str("node", format!("{:?}", self.name))
+                        .str("digest", format!("{:?}", digest))
+                        .u64("worker_id", *worker_id as u64)
+                        .str("header_digest", format!("{:?}", header.id))
+                        .u64("round", header.round)
+                        .str("author", format!("{:?}", header.author)),
+                );
+            }
+        }
 
         #[cfg(feature = "benchmark")]
         for digest in header.payload.keys() {

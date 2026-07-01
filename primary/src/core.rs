@@ -9,6 +9,7 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
+use lifecycle_trace::Event;
 use log::{debug, error, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
@@ -141,6 +142,8 @@ impl Core {
     #[async_recursion]
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
         debug!("Processing {:?}", header);
+        self.trace_payload_references(header, "core_process_header");
+
         // Indicate that we are processing this header.
         self.processing
             .entry(header.round)
@@ -211,6 +214,25 @@ impl Core {
             }
         }
         Ok(())
+    }
+
+    fn trace_payload_references(&self, header: &Header, source: &'static str) {
+        if !lifecycle_trace::enabled() {
+            return;
+        }
+
+        for (digest, worker_id) in &header.payload {
+            lifecycle_trace::write(
+                Event::new("primary", "PayloadReferenced")
+                    .str("source", source)
+                    .str("node", format!("{:?}", self.name))
+                    .str("digest", format!("{:?}", digest))
+                    .u64("worker_id", *worker_id as u64)
+                    .str("header_digest", format!("{:?}", header.id))
+                    .u64("round", header.round)
+                    .str("author", format!("{:?}", header.author)),
+            );
+        }
     }
 
     #[async_recursion]

@@ -156,10 +156,16 @@ impl Primary {
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_consensus);
+        GarbageCollector::spawn(
+            &name,
+            &committee,
+            consensus_round.clone(),
+            parameters.gc_depth,
+            rx_consensus,
+        );
 
         // Receives batch digests from other workers. They are only used to validate headers.
-        PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
+        PayloadReceiver::spawn(name, store.clone(), /* rx_workers */ rx_others_digests);
 
         // Whenever the `Synchronizer` does not manage to validate a header due to missing parent certificates of
         // batch digests, it commands the `HeaderWaiter` to synchronizer with other nodes, wait for their reply, and
@@ -179,6 +185,7 @@ impl Primary {
         // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
         // `Core` for further processing.
         CertificateWaiter::spawn(
+            name,
             store.clone(),
             /* rx_synchronizer */ rx_sync_certificates,
             /* tx_core */ tx_certificates_loopback,

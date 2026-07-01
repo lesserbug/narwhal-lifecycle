@@ -11,6 +11,7 @@ log = "0.4.14"
 crypto = { path = "../crypto" }
 config = { path = "../config" }
 primary = { path = "../primary" }
+lifecycle-trace = { path = "../lifecycle-trace" }
 
 [dev-dependencies]
 rand = "0.7.3"
