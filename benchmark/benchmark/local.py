@@ -56,7 +56,6 @@ class LocalBench:
             'slow',
             '--checkpoint-every',
             '100',
-            '--plots',
         ]
         subprocess.run(cmd, check=True)
         Print.info(f'Lifecycle traces written to {PathMaker.lifecycle_logs_path()}')

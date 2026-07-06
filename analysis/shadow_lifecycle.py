@@ -10,9 +10,25 @@ import argparse
 import csv
 import json
 import math
+import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+OLD_LIVE_REASONS = (
+    "committed_not_executed",
+    "checkpoint_pending",
+    "repair_waiter_active",
+    "referenced_not_committed_or_unknown",
+    "unknown_or_insufficient_trace",
+)
+
+RETAINED_DEAD_REASONS = (
+    "executed_and_checkpointed",
+    "no_obligation",
+    "unknown",
+)
 
 
 @dataclass
@@ -51,10 +67,22 @@ class RepairRecord:
     retry_count: int = 0
 
 
+@dataclass
+class MismatchStats:
+    old_live_count: int = 0
+    old_live_bytes: int = 0
+    retained_dead_count: int = 0
+    retained_dead_bytes: int = 0
+    old_live_why_counts: Dict[str, int] = field(default_factory=dict)
+    old_live_why_bytes: Dict[str, int] = field(default_factory=dict)
+    retained_dead_why_counts: Dict[str, int] = field(default_factory=dict)
+    retained_dead_why_bytes: Dict[str, int] = field(default_factory=dict)
+
+
 def read_events(paths: Iterable[Path]) -> List[dict]:
     events = []
     for file_index, path in enumerate(paths):
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             for line_index, line in enumerate(f):
                 line = line.strip()
                 if not line:
@@ -92,6 +120,27 @@ def repair_key(event: dict) -> Tuple[str, str, str, str, str, str]:
         str(event.get("related_header_digest", "")),
         str(event.get("certificate_digest", "")),
     )
+
+
+def validator_id_from_path(path: str) -> Optional[str]:
+    name = Path(path).name
+    match = re.match(r"primary-(\d+)\.jsonl$", name)
+    if match:
+        return match.group(1)
+    match = re.match(r"worker-(\d+)-\d+\.jsonl$", name)
+    if match:
+        return match.group(1)
+    return None
+
+
+def group_events_by_validator(events: List[dict]) -> Dict[str, List[dict]]:
+    grouped: Dict[str, List[dict]] = {}
+    for event in events:
+        validator_id = validator_id_from_path(str(event.get("_file", "")))
+        if validator_id is None:
+            continue
+        grouped.setdefault(validator_id, []).append(event)
+    return grouped
 
 
 def replay(events: List[dict]) -> Tuple[Dict[str, BatchState], List[CommitRecord], List[dict], List[RepairRecord]]:
@@ -366,28 +415,7 @@ def write_mismatch(out_dir: Path, batches: Dict[str, BatchState], cleanup_events
     for event in cleanup_events:
         ts_ms = int(event.get("ts_ms", 0))
         cleanup_round = int(event.get("cleanup_round", 0))
-        old_live_count = 0
-        old_live_bytes = 0
-        no_obligation_retained_count = 0
-        no_obligation_retained_bytes = 0
-        why_counts: Dict[str, int] = {}
-
-        for state in batches.values():
-            ref_round = state.first_referenced_round
-            if ref_round is None:
-                continue
-            old_by_round = ref_round <= cleanup_round
-            retained_by_round_window = ref_round > cleanup_round
-            why = why_live_at(state, ts_ms, repairs)
-            live = why != "not_live"
-            if live:
-                why_counts[why] = why_counts.get(why, 0) + 1
-            if old_by_round and live:
-                old_live_count += 1
-                old_live_bytes += state.size_bytes
-            if retained_by_round_window and not live:
-                no_obligation_retained_count += 1
-                no_obligation_retained_bytes += state.size_bytes
+        stats = mismatch_stats_at(ts_ms, cleanup_round, batches, repairs)
 
         row = {
             "ts_ms": ts_ms,
@@ -395,15 +423,65 @@ def write_mismatch(out_dir: Path, batches: Dict[str, BatchState], cleanup_events
             "committed_round": event.get("committed_round", ""),
             "cleanup_round": cleanup_round,
             "gc_depth": event.get("gc_depth", ""),
-            "old_by_round_but_live_count": old_live_count,
-            "old_by_round_but_live_bytes": old_live_bytes,
-            "no_local_obligation_but_retained_count": no_obligation_retained_count,
-            "no_local_obligation_but_retained_bytes": no_obligation_retained_bytes,
+            "old_by_round_but_live_count": stats.old_live_count,
+            "old_by_round_but_live_bytes": stats.old_live_bytes,
+            "no_local_obligation_but_retained_count": stats.retained_dead_count,
+            "no_local_obligation_but_retained_bytes": stats.retained_dead_bytes,
         }
-        row.update({f"why_{k}": v for k, v in sorted(why_counts.items())})
+        row.update(mismatch_reason_columns(stats))
         rows.append(row)
 
     write_csv(out_dir / "round_policy_mismatch.csv", rows)
+
+
+def mismatch_stats_at(
+    ts_ms: int,
+    cleanup_round: int,
+    batches: Dict[str, BatchState],
+    repairs: List[RepairRecord],
+) -> MismatchStats:
+    stats = MismatchStats()
+
+    for state in batches.values():
+        if state.first_referenced_at is None or state.first_referenced_at > ts_ms:
+            continue
+        ref_round = state.first_referenced_round
+        if ref_round is None:
+            continue
+
+        old_by_round = ref_round <= cleanup_round
+        retained_by_round_window = ref_round > cleanup_round
+        live_reason = why_live_at(state, ts_ms, repairs)
+        live = live_reason != "not_live"
+
+        if old_by_round and live:
+            stats.old_live_count += 1
+            stats.old_live_bytes += state.size_bytes
+            add_reason(stats.old_live_why_counts, stats.old_live_why_bytes, live_reason, state.size_bytes)
+
+        if retained_by_round_window and not live:
+            dead_reason = why_dead_at(state, ts_ms)
+            stats.retained_dead_count += 1
+            stats.retained_dead_bytes += state.size_bytes
+            add_reason(stats.retained_dead_why_counts, stats.retained_dead_why_bytes, dead_reason, state.size_bytes)
+
+    return stats
+
+
+def mismatch_reason_columns(stats: MismatchStats) -> dict:
+    columns = {}
+    for reason in OLD_LIVE_REASONS:
+        columns[f"old_live_why_{reason}"] = stats.old_live_why_counts.get(reason, 0)
+        columns[f"old_live_why_{reason}_bytes"] = stats.old_live_why_bytes.get(reason, 0)
+    for reason in RETAINED_DEAD_REASONS:
+        columns[f"retained_dead_why_{reason}"] = stats.retained_dead_why_counts.get(reason, 0)
+        columns[f"retained_dead_why_{reason}_bytes"] = stats.retained_dead_why_bytes.get(reason, 0)
+    return columns
+
+
+def add_reason(counts: Dict[str, int], bytes_by_reason: Dict[str, int], reason: str, size_bytes: int) -> None:
+    counts[reason] = counts.get(reason, 0) + 1
+    bytes_by_reason[reason] = bytes_by_reason.get(reason, 0) + size_bytes
 
 
 def why_live_at(state: BatchState, ts_ms: int, repairs: List[RepairRecord]) -> str:
@@ -423,6 +501,14 @@ def why_live_at(state: BatchState, ts_ms: int, repairs: List[RepairRecord]) -> s
     if state.first_referenced_at is not None and state.first_referenced_at <= ts_ms:
         return "referenced_not_committed_or_unknown"
     return "unknown_or_insufficient_trace"
+
+
+def why_dead_at(state: BatchState, ts_ms: int) -> str:
+    if state.executed_at is not None and state.executed_at <= ts_ms:
+        if state.checkpointed_at is not None and state.checkpointed_at <= ts_ms:
+            return "executed_and_checkpointed"
+        return "no_obligation"
+    return "unknown"
 
 
 def write_repair_lifetimes(out_dir: Path, repairs: List[RepairRecord]) -> dict:
@@ -450,6 +536,67 @@ def write_repair_lifetimes(out_dir: Path, repairs: List[RepairRecord]) -> dict:
     }
 
 
+def write_validator_summary(out_dir: Path, events: List[dict], args) -> List[dict]:
+    rows = []
+    for validator_id, validator_events in sorted(group_events_by_validator(events).items(), key=lambda x: int(x[0])):
+        batches, commits, cleanup_events, repairs = replay(validator_events)
+        apply_mock_execution(commits, args)
+        propagate_mock_times(batches, commits)
+
+        if cleanup_events:
+            latest_cleanup = cleanup_events[-1]
+            ts_ms = int(latest_cleanup.get("ts_ms", 0))
+            cleanup_round = int(latest_cleanup.get("cleanup_round", 0))
+            committed_round = latest_cleanup.get("committed_round", "")
+        else:
+            ts_ms = max((int(event.get("ts_ms", 0)) for event in validator_events), default=0)
+            cleanup_round = 0
+            committed_round = ""
+
+        stats = mismatch_stats_at(ts_ms, cleanup_round, batches, repairs)
+        lifetimes = [x.cleared_at - x.added_at for x in repairs if x.cleared_at is not None]
+        dominant_reason = dominant_old_live_reason(stats)
+
+        rows.append(
+            {
+                "validator_id": validator_id,
+                "snapshot_kind": "latest_cleanup" if cleanup_events else "no_cleanup",
+                "ts_ms": ts_ms,
+                "committed_round": committed_round,
+                "cleanup_round": cleanup_round,
+                "event_count": len(validator_events),
+                "batch_count": len(batches),
+                "old_by_round_but_live_count": stats.old_live_count,
+                "old_by_round_but_live_bytes": stats.old_live_bytes,
+                "no_local_obligation_but_retained_count": stats.retained_dead_count,
+                "no_local_obligation_but_retained_bytes": stats.retained_dead_bytes,
+                "dominant_old_live_reason": dominant_reason,
+                "active_repair_waiters": active_repair_waiters_at(repairs, ts_ms),
+                "repair_waiter_lifetime_p95_ms": percentile(lifetimes, 0.95),
+            }
+        )
+
+    write_csv(out_dir / "validator_summary.csv", rows)
+    return rows
+
+
+def dominant_old_live_reason(stats: MismatchStats) -> str:
+    if not stats.old_live_why_bytes:
+        return ""
+    reason, bytes_value = max(stats.old_live_why_bytes.items(), key=lambda x: (x[1], x[0]))
+    if bytes_value == 0:
+        return ""
+    return reason
+
+
+def active_repair_waiters_at(repairs: List[RepairRecord], ts_ms: int) -> int:
+    return sum(
+        1
+        for repair in repairs
+        if repair.added_at <= ts_ms and (repair.cleared_at is None or ts_ms < repair.cleared_at)
+    )
+
+
 def write_csv(path: Path, rows: List[dict]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -468,46 +615,54 @@ def write_csv(path: Path, rows: List[dict]) -> None:
 def maybe_write_plots(out_dir: Path) -> None:
     try:
         import matplotlib.pyplot as plt
-    except Exception:
+    except Exception as exc:
+        print(f"warning: matplotlib is unavailable; skipping plots: {exc}", file=sys.stderr)
         return
 
-    latency_file = out_dir / "lifecycle_latencies.csv"
-    if latency_file.exists() and latency_file.stat().st_size > 0:
-        with latency_file.open("r", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        for field in (
-            "write_to_reference_ms",
-            "reference_to_commit_ms",
-            "commit_to_mock_execute_ms",
-            "mock_execute_to_checkpoint_ms",
-        ):
-            values = sorted(int(row[field]) for row in rows if row.get(field))
-            if not values:
-                continue
-            y = [(i + 1) / len(values) for i in range(len(values))]
-            plt.plot(values, y, label=field)
-        plt.xlabel("latency (ms)")
-        plt.ylabel("CDF")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(out_dir / "lifecycle_latency_cdf.png")
-        plt.close()
-
-    frontier_file = out_dir / "frontier_timeseries.csv"
-    if frontier_file.exists() and frontier_file.stat().st_size > 0:
-        with frontier_file.open("r", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        if rows:
-            base = int(rows[0]["ts_ms"])
-            xs = [(int(row["ts_ms"]) - base) / 1000.0 for row in rows]
-            for field in ("commit_round", "cleanup_round", "mock_execution_round", "mock_checkpoint_round"):
-                plt.plot(xs, [int(row[field]) for row in rows], label=field)
-            plt.xlabel("time since first event (s)")
-            plt.ylabel("round")
+    try:
+        latency_file = out_dir / "lifecycle_latencies.csv"
+        if latency_file.exists() and latency_file.stat().st_size > 0:
+            with latency_file.open("r", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            for field in (
+                "write_to_reference_ms",
+                "reference_to_commit_ms",
+                "commit_to_mock_execute_ms",
+                "mock_execute_to_checkpoint_ms",
+            ):
+                values = sorted(int(row[field]) for row in rows if row.get(field))
+                if not values:
+                    continue
+                y = [(i + 1) / len(values) for i in range(len(values))]
+                plt.plot(values, y, label=field)
+            plt.xlabel("latency (ms)")
+            plt.ylabel("CDF")
             plt.legend()
             plt.tight_layout()
-            plt.savefig(out_dir / "frontier_skew.png")
+            plt.savefig(out_dir / "lifecycle_latency_cdf.png")
             plt.close()
+
+        frontier_file = out_dir / "frontier_timeseries.csv"
+        if frontier_file.exists() and frontier_file.stat().st_size > 0:
+            with frontier_file.open("r", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            if rows:
+                base = int(rows[0]["ts_ms"])
+                xs = [(int(row["ts_ms"]) - base) / 1000.0 for row in rows]
+                for field in ("commit_round", "cleanup_round", "mock_execution_round", "mock_checkpoint_round"):
+                    plt.plot(xs, [int(row[field]) for row in rows], label=field)
+                plt.xlabel("time since first event (s)")
+                plt.ylabel("round")
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(out_dir / "frontier_skew.png")
+                plt.close()
+    except Exception as exc:
+        print(f"warning: failed to render lifecycle plots; CSV/JSON outputs are still valid: {exc}", file=sys.stderr)
+        try:
+            plt.close("all")
+        except Exception:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -544,6 +699,7 @@ def main() -> None:
     write_frontiers(args.out_dir, events, commits, cleanup_events, repairs)
     write_mismatch(args.out_dir, batches, cleanup_events, repairs)
     repair_summary = write_repair_lifetimes(args.out_dir, repairs)
+    validator_rows = write_validator_summary(args.out_dir, events, args)
 
     summary = {
         "input_files": [str(x) for x in args.trace],
@@ -552,8 +708,17 @@ def main() -> None:
         "commit_count": len(commits),
         "cleanup_event_count": len(cleanup_events),
         "repair_waiter_count": len(repairs),
+        "validator_count": len(validator_rows),
         "latency": latency,
         "repair": repair_summary,
+        "analysis_model": {
+            "checkpoint_pending_is_live": True,
+            "not_live_definition": "payload is not live only after mock execution and mock checkpoint coverage",
+            "storage_bytes_source": "BatchWriteSubmitted.batch_size_bytes",
+            "payload_marker_bytes_counted": False,
+            "validator_summary_snapshot": "latest cleanup event per validator",
+            "reference_round_policy": "first_referenced_round",
+        },
         "interpretation": (
             "This is a derived shadow view over passive traces. It compares a hypothetical "
             "round/gc_depth payload lifecycle policy with local obligations; it is not evidence "
