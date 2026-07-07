@@ -143,6 +143,46 @@ def group_events_by_validator(events: List[dict]) -> Dict[str, List[dict]]:
     return grouped
 
 
+def int_or_none(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def int_or_default(value, default: int = 0) -> int:
+    parsed = int_or_none(value)
+    return default if parsed is None else parsed
+
+
+def runtime_cleanup_round(event: dict) -> int:
+    return int_or_default(event.get("cleanup_round"), 0)
+
+
+def policy_cleanup_round(event: dict, args) -> int:
+    policy_gc_depth = getattr(args, "policy_gc_depth", None)
+    if policy_gc_depth is None:
+        return runtime_cleanup_round(event)
+
+    committed_round = int_or_none(event.get("committed_round"))
+    if committed_round is None:
+        return runtime_cleanup_round(event)
+    return max(0, committed_round - policy_gc_depth)
+
+
+def policy_cleanup_runtime_fallback_count(cleanup_events: List[dict], args) -> int:
+    if getattr(args, "policy_gc_depth", None) is None:
+        return 0
+    return sum(1 for event in cleanup_events if int_or_none(event.get("committed_round")) is None)
+
+
+def policy_gc_depth(event: dict, args):
+    configured = getattr(args, "policy_gc_depth", None)
+    return event.get("gc_depth", "") if configured is None else configured
+
+
 def replay(events: List[dict]) -> Tuple[Dict[str, BatchState], List[CommitRecord], List[dict], List[RepairRecord]]:
     batches: Dict[str, BatchState] = {}
     commits: List[CommitRecord] = []
@@ -370,7 +410,14 @@ def append_if_not_none(values: List[int], value: Optional[int]) -> None:
         values.append(value)
 
 
-def write_frontiers(out_dir: Path, events: List[dict], commits: List[CommitRecord], cleanup_events: List[dict], repairs: List[RepairRecord]) -> None:
+def write_frontiers(
+    out_dir: Path,
+    events: List[dict],
+    commits: List[CommitRecord],
+    cleanup_events: List[dict],
+    repairs: List[RepairRecord],
+    args,
+) -> None:
     times = {int(x.get("ts_ms", 0)) for x in events}
     times.update(x.executed_at for x in commits if x.executed_at is not None)
     times.update(x.checkpointed_at for x in commits if x.checkpointed_at is not None)
@@ -383,9 +430,17 @@ def write_frontiers(out_dir: Path, events: List[dict], commits: List[CommitRecor
             (x.round for x in commits if x.checkpointed_at is not None and x.checkpointed_at <= ts),
             default=0,
         )
-        cleanup_round = max(
+        runtime_cleanup = max(
             (
-                int(x.get("cleanup_round", 0))
+                runtime_cleanup_round(x)
+                for x in cleanup_events
+                if int(x.get("ts_ms", 0)) <= ts
+            ),
+            default=0,
+        )
+        policy_cleanup = max(
+            (
+                policy_cleanup_round(x, args)
                 for x in cleanup_events
                 if int(x.get("ts_ms", 0)) <= ts
             ),
@@ -400,7 +455,9 @@ def write_frontiers(out_dir: Path, events: List[dict], commits: List[CommitRecor
             {
                 "ts_ms": ts,
                 "commit_round": commit_round,
-                "cleanup_round": cleanup_round,
+                "cleanup_round": policy_cleanup,
+                "policy_cleanup_round": policy_cleanup,
+                "runtime_cleanup_round": runtime_cleanup,
                 "mock_execution_round": execution_round,
                 "mock_checkpoint_round": checkpoint_round,
                 "active_repair_waiters": active_repairs,
@@ -410,11 +467,12 @@ def write_frontiers(out_dir: Path, events: List[dict], commits: List[CommitRecor
     write_csv(out_dir / "frontier_timeseries.csv", rows)
 
 
-def write_mismatch(out_dir: Path, batches: Dict[str, BatchState], cleanup_events: List[dict], repairs: List[RepairRecord]) -> None:
+def write_mismatch(out_dir: Path, batches: Dict[str, BatchState], cleanup_events: List[dict], repairs: List[RepairRecord], args) -> None:
     rows = []
     for event in cleanup_events:
         ts_ms = int(event.get("ts_ms", 0))
-        cleanup_round = int(event.get("cleanup_round", 0))
+        runtime_cleanup = runtime_cleanup_round(event)
+        cleanup_round = policy_cleanup_round(event, args)
         stats = mismatch_stats_at(ts_ms, cleanup_round, batches, repairs)
 
         row = {
@@ -422,7 +480,11 @@ def write_mismatch(out_dir: Path, batches: Dict[str, BatchState], cleanup_events
             "source": event.get("source", ""),
             "committed_round": event.get("committed_round", ""),
             "cleanup_round": cleanup_round,
-            "gc_depth": event.get("gc_depth", ""),
+            "policy_cleanup_round": cleanup_round,
+            "runtime_cleanup_round": runtime_cleanup,
+            "gc_depth": policy_gc_depth(event, args),
+            "policy_gc_depth": policy_gc_depth(event, args),
+            "runtime_gc_depth": event.get("gc_depth", ""),
             "old_by_round_but_live_count": stats.old_live_count,
             "old_by_round_but_live_bytes": stats.old_live_bytes,
             "no_local_obligation_but_retained_count": stats.retained_dead_count,
@@ -546,12 +608,18 @@ def write_validator_summary(out_dir: Path, events: List[dict], args) -> List[dic
         if cleanup_events:
             latest_cleanup = cleanup_events[-1]
             ts_ms = int(latest_cleanup.get("ts_ms", 0))
-            cleanup_round = int(latest_cleanup.get("cleanup_round", 0))
+            runtime_cleanup = runtime_cleanup_round(latest_cleanup)
+            cleanup_round = policy_cleanup_round(latest_cleanup, args)
             committed_round = latest_cleanup.get("committed_round", "")
+            gc_depth = policy_gc_depth(latest_cleanup, args)
+            runtime_gc_depth = latest_cleanup.get("gc_depth", "")
         else:
             ts_ms = max((int(event.get("ts_ms", 0)) for event in validator_events), default=0)
+            runtime_cleanup = 0
             cleanup_round = 0
             committed_round = ""
+            gc_depth = ""
+            runtime_gc_depth = ""
 
         stats = mismatch_stats_at(ts_ms, cleanup_round, batches, repairs)
         lifetimes = [x.cleared_at - x.added_at for x in repairs if x.cleared_at is not None]
@@ -564,6 +632,11 @@ def write_validator_summary(out_dir: Path, events: List[dict], args) -> List[dic
                 "ts_ms": ts_ms,
                 "committed_round": committed_round,
                 "cleanup_round": cleanup_round,
+                "policy_cleanup_round": cleanup_round,
+                "runtime_cleanup_round": runtime_cleanup,
+                "gc_depth": gc_depth,
+                "policy_gc_depth": gc_depth,
+                "runtime_gc_depth": runtime_gc_depth,
                 "event_count": len(validator_events),
                 "batch_count": len(batches),
                 "old_by_round_but_live_count": stats.old_live_count,
@@ -680,6 +753,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bursty-pause-ms", type=int, default=10000)
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--checkpoint-interval-ms", type=int, default=0)
+    parser.add_argument(
+        "--policy-gc-depth",
+        type=int,
+        default=None,
+        help="Hypothetical payload lifecycle gc_depth. Defaults to the runtime cleanup_round from traces.",
+    )
     parser.add_argument("--plots", action="store_true", help="Write PNG plots if matplotlib is installed")
     return parser.parse_args()
 
@@ -696,8 +775,8 @@ def main() -> None:
     propagate_mock_times(batches, commits)
 
     latency = write_lifecycle_latencies(args.out_dir, batches)
-    write_frontiers(args.out_dir, events, commits, cleanup_events, repairs)
-    write_mismatch(args.out_dir, batches, cleanup_events, repairs)
+    write_frontiers(args.out_dir, events, commits, cleanup_events, repairs, args)
+    write_mismatch(args.out_dir, batches, cleanup_events, repairs, args)
     repair_summary = write_repair_lifetimes(args.out_dir, repairs)
     validator_rows = write_validator_summary(args.out_dir, events, args)
 
@@ -711,6 +790,7 @@ def main() -> None:
         "validator_count": len(validator_rows),
         "latency": latency,
         "repair": repair_summary,
+        "policy_cleanup_runtime_fallback_count": policy_cleanup_runtime_fallback_count(cleanup_events, args),
         "analysis_model": {
             "checkpoint_pending_is_live": True,
             "not_live_definition": "payload is not live only after mock execution and mock checkpoint coverage",
@@ -718,6 +798,11 @@ def main() -> None:
             "payload_marker_bytes_counted": False,
             "validator_summary_snapshot": "latest cleanup event per validator",
             "reference_round_policy": "first_referenced_round",
+            "policy_gc_depth": args.policy_gc_depth,
+            "policy_gc_depth_semantics": (
+                "None uses runtime cleanup_round from traces; otherwise cleanup_round is recomputed as "
+                "committed_round - policy_gc_depth for hypothetical lifecycle analysis"
+            ),
         },
         "interpretation": (
             "This is a derived shadow view over passive traces. It compares a hypothetical "
