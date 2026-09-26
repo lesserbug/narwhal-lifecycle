@@ -34,9 +34,9 @@ def main():
     markers = read_events(args.fault_events) if args.fault_events else []
     warmup_completed = next((event["ts_ms"] for event in markers
                              if event["event"] == "WarmupCompleted"), None)
-    fault_started = next((event["ts_ms"] for event in markers
+    fault_started = next((event["signal_sent_ms"] for event in markers
                           if event["event"] == "FaultStarted"), None)
-    fault_ended = next((event["ts_ms"] for event in markers
+    fault_ended = next((event["signal_sent_ms"] for event in markers
                         if event["event"] == "FaultEnded"), None)
 
     def phase(ts_ms):
@@ -131,8 +131,40 @@ def main():
                              "success" if success else "missing",
                              event["batch_size_bytes"] if success else "", repeats[key]])
 
+    active_batches = {}
+    batch_waiters = []
+    unmatched_batch_clears = 0
+    for event in read_events(args.trace_dir / f"{args.target}.jsonl"):
+        if event.get("reason") != "missing_batch":
+            continue
+        digest = event["missing_digest"]
+        if event["event"] == "RepairWaiterAdded":
+            if digest in active_batches:
+                parser.error("duplicate active primary missing-batch waiter")
+            active_batches[digest] = event
+        elif event["event"] == "RepairWaiterCleared":
+            added = active_batches.pop(digest, None)
+            if added is None:
+                unmatched_batch_clears += 1
+            else:
+                batch_waiters.append((added, event))
+    batch_waiters.extend((added, None) for added in active_batches.values())
+    batch_phases = {}
+    with (args.out_dir / "primary_batch_waiters.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["digest", "add_ts_ms", "add_phase", "round", "author",
+                         "clear_ts_ms", "result", "lifetime_ms"])
+        for added, cleared in sorted(batch_waiters, key=lambda pair: pair[0]["ts_ms"]):
+            result = cleared["clear_reason"] if cleared else "unresolved"
+            add_phase = phase(added["ts_ms"])
+            batch_phases.setdefault(add_phase, Counter())[result] += 1
+            writer.writerow([added["missing_digest"], added["ts_ms"], add_phase,
+                             added["round"], added["author"],
+                             cleared["ts_ms"] if cleared else "", result,
+                             cleared["ts_ms"] - added["ts_ms"] if cleared else ""])
+
     summary = {
-        "scope": "target ordering and provider reads; no fault or recovery-time claim",
+        "scope": "target ordering, provider reads, and primary missing-batch waiters; no execution or recovery-time claim",
         "warmup_completed_ms": warmup_completed,
         "fault_started_ms": fault_started,
         "fault_ended_ms": fault_ended,
@@ -164,6 +196,18 @@ def main():
         "target_worker_sync_cleanup_cancelled": waiter_cancelled,
         "target_worker_sync_unmatched_clears": unmatched_clears,
         "target_worker_sync_unmatched_retries": unmatched_retries,
+        "target_primary_missing_batch_added": len(batch_waiters),
+        "target_primary_missing_batch_resolved": sum(
+            cleared is not None and cleared["clear_reason"] == "resolved"
+            for _, cleared in batch_waiters),
+        "target_primary_missing_batch_cleanup_cancelled": sum(
+            cleared is not None and cleared["clear_reason"] == "cleanup_cancelled"
+            for _, cleared in batch_waiters),
+        "target_primary_missing_batch_unresolved": len(active_batches),
+        "target_primary_missing_batch_unmatched_clears": unmatched_batch_clears,
+        "target_primary_missing_batch_by_add_phase": {
+            name: dict(results) for name, results in batch_phases.items()
+        },
     }
     (args.out_dir / "summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8")

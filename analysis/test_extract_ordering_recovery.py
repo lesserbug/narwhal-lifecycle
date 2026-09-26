@@ -75,8 +75,8 @@ class ExtractOrderingRecoveryTests(unittest.TestCase):
         ])
         markers = self.root / "fault-events.jsonl"
         write_events(markers, [
-            {"event": "FaultStarted", "ts_ms": 1500},
-            {"event": "FaultEnded", "ts_ms": 2500},
+            {"event": "FaultStarted", "signal_sent_ms": 1500, "ts_ms": 1800},
+            {"event": "FaultEnded", "signal_sent_ms": 2500, "ts_ms": 2800},
         ])
         self.assertEqual(self.extract(markers).returncode, 0)
         with (self.root / "result/progress.csv").open(newline="") as stream:
@@ -89,6 +89,30 @@ class ExtractOrderingRecoveryTests(unittest.TestCase):
         with (self.root / "result/attempts.csv").open(newline="") as stream:
             attempts = list(csv.DictReader(stream))
         self.assertEqual(attempts[0]["phase"], "during_fault")
+
+    def test_primary_missing_batch_cancellation_is_not_resolution(self):
+        with (self.traces / "primary-0.jsonl").open("a", encoding="utf-8") as stream:
+            for event in [
+                {"event": "RepairWaiterAdded", "reason": "missing_batch", "missing_digest": "X",
+                 "ts_ms": 1500, "round": 1, "author": "peer"},
+                {"event": "RepairWaiterCleared", "reason": "missing_batch", "missing_digest": "X",
+                 "ts_ms": 2000, "clear_reason": "cleanup_cancelled"},
+                {"event": "RepairWaiterAdded", "reason": "missing_batch", "missing_digest": "Y",
+                 "ts_ms": 2500, "round": 2, "author": "peer"},
+                {"event": "RepairWaiterCleared", "reason": "missing_batch", "missing_digest": "Y",
+                 "ts_ms": 3000, "clear_reason": "resolved"},
+            ]:
+                stream.write(json.dumps(event) + "\n")
+        self.assertEqual(self.extract().returncode, 0)
+        summary = json.loads((self.root / "result/summary.json").read_text())
+        self.assertEqual(summary["target_primary_missing_batch_added"], 2)
+        self.assertEqual(summary["target_primary_missing_batch_resolved"], 1)
+        self.assertEqual(summary["target_primary_missing_batch_cleanup_cancelled"], 1)
+        with (self.root / "result/primary_batch_waiters.csv").open(newline="") as stream:
+            waiters = list(csv.DictReader(stream))
+        self.assertEqual([row["result"] for row in waiters],
+                         ["cleanup_cancelled", "resolved"])
+        self.assertEqual(waiters[0]["lifetime_ms"], "500")
 
     def test_cleanup_cancellation_is_not_resolution(self):
         write_events(self.traces / "worker-0-0.jsonl", [
