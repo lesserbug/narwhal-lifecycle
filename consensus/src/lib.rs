@@ -180,6 +180,16 @@ impl Consensus {
 
             // Output the sequence in the right order.
             for certificate in sequence {
+                self.tx_primary
+                    .send(certificate.clone())
+                    .await
+                    .expect("Failed to send certificate to primary");
+
+                if let Err(e) = self.tx_output.send(certificate.clone()).await {
+                    warn!("Failed to output certificate: {}", e);
+                    continue;
+                }
+
                 if lifecycle_trace::enabled() {
                     lifecycle_trace::write(
                         Event::new("consensus", "CertificateCommitted")
@@ -216,15 +226,6 @@ impl Consensus {
                 for digest in certificate.header.payload.keys() {
                     // NOTE: This log entry is used to compute performance.
                     info!("Committed {} -> {:?}", certificate.header, digest);
-                }
-
-                self.tx_primary
-                    .send(certificate.clone())
-                    .await
-                    .expect("Failed to send certificate to primary");
-
-                if let Err(e) = self.tx_output.send(certificate).await {
-                    warn!("Failed to output certificate: {}", e);
                 }
             }
         }
