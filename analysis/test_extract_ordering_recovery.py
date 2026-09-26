@@ -32,23 +32,26 @@ class ExtractOrderingRecoveryTests(unittest.TestCase):
             {"event": "CertificateCommitted", "certificate_digest": "B", "ts_ms": 2000},
         ])
 
-    def extract(self):
-        return subprocess.run([
+    def extract(self, fault_events=None):
+        command = [
             sys.executable, str(SCRIPT), "--trace-dir", str(self.traces),
             "--target", "primary-0", "--reference", "primary-1",
             "--target-key-file", str(self.key_file),
             "--out-dir", str(self.root / "result"),
-        ], capture_output=True, text=True)
+        ]
+        if fault_events:
+            command += ["--fault-events", str(fault_events)]
+        return subprocess.run(command, capture_output=True, text=True)
 
     def test_target_identity_and_repeated_provider_reads(self):
         write_events(self.traces / "worker-1-0.jsonl", [
-            {"event": "BatchReadCompleted", "seq": 1, "requester": "target-key",
+            {"event": "BatchReadCompleted", "seq": 1, "ts_ms": 1500, "requester": "target-key",
              "digest": "X", "batch_size_bytes": 10},
-            {"event": "BatchReadCompleted", "seq": 2, "requester": "other-key",
+            {"event": "BatchReadCompleted", "seq": 2, "ts_ms": 1600, "requester": "other-key",
              "digest": "X", "batch_size_bytes": 10},
-            {"event": "BatchReadCompleted", "seq": 3, "requester": "target-key",
+            {"event": "BatchReadCompleted", "seq": 3, "ts_ms": 2100, "requester": "target-key",
              "digest": "X", "batch_size_bytes": 10},
-            {"event": "BatchReadMissing", "seq": 4, "requester": "target-key",
+            {"event": "BatchReadMissing", "seq": 4, "ts_ms": 2200, "requester": "target-key",
              "digest": "Y"},
         ])
         self.assertEqual(self.extract().returncode, 0)
@@ -64,6 +67,28 @@ class ExtractOrderingRecoveryTests(unittest.TestCase):
         with (self.root / "result/progress.csv").open(newline="") as stream:
             progress = list(csv.DictReader(stream))
         self.assertEqual(progress[1]["ordering_lag"], "1")
+
+    def test_fault_phase_marks_progress_and_provider_work(self):
+        write_events(self.traces / "worker-1-0.jsonl", [
+            {"event": "BatchReadCompleted", "seq": 1, "ts_ms": 2100,
+             "requester": "target-key", "digest": "X", "batch_size_bytes": 10},
+        ])
+        markers = self.root / "fault-events.jsonl"
+        write_events(markers, [
+            {"event": "FaultStarted", "ts_ms": 1500},
+            {"event": "FaultEnded", "ts_ms": 2500},
+        ])
+        self.assertEqual(self.extract(markers).returncode, 0)
+        with (self.root / "result/progress.csv").open(newline="") as stream:
+            progress = list(csv.DictReader(stream))
+        self.assertEqual(progress[0]["phase"], "before_fault")
+        self.assertEqual(progress[1]["phase"], "during_fault")
+        self.assertEqual(progress[2]["phase"], "after_fault")
+        summary = json.loads((self.root / "result/summary.json").read_text())
+        self.assertEqual(summary["ordering_lag_by_phase"]["during_fault"]["max"], 1)
+        with (self.root / "result/attempts.csv").open(newline="") as stream:
+            attempts = list(csv.DictReader(stream))
+        self.assertEqual(attempts[0]["phase"], "during_fault")
 
     def test_cleanup_cancellation_is_not_resolution(self):
         write_events(self.traces / "worker-0-0.jsonl", [

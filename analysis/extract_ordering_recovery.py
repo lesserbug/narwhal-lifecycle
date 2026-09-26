@@ -1,4 +1,4 @@
-"""Extract one Narwhal ordering target's clean progress and batch-read work."""
+"""Extract one Narwhal ordering target's progress and batch-read work."""
 
 import argparse
 import csv
@@ -26,9 +26,29 @@ def main():
     parser.add_argument("--reference", required=True, help="unaffected primary filename stem")
     parser.add_argument("--target-key-file", required=True, type=Path,
                         help="benchmark/.node-0.json for the target authority")
+    parser.add_argument("--fault-events", type=Path,
+                        help="fault-events.jsonl from benchmark/recovery_pilot.py")
     parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
     target_key = json.loads(args.target_key_file.read_text(encoding="utf-8"))["name"]
+    markers = read_events(args.fault_events) if args.fault_events else []
+    warmup_completed = next((event["ts_ms"] for event in markers
+                             if event["event"] == "WarmupCompleted"), None)
+    fault_started = next((event["ts_ms"] for event in markers
+                          if event["event"] == "FaultStarted"), None)
+    fault_ended = next((event["ts_ms"] for event in markers
+                        if event["event"] == "FaultEnded"), None)
+
+    def phase(ts_ms):
+        if warmup_completed is not None and ts_ms < warmup_completed:
+            return "warmup"
+        if fault_started is None:
+            return "clean"
+        if ts_ms < fault_started:
+            return "before_fault"
+        if fault_ended is None or ts_ms < fault_ended:
+            return "during_fault"
+        return "after_fault"
 
     target = output_events(args.trace_dir / f"{args.target}.jsonl")
     reference = output_events(args.trace_dir / f"{args.reference}.jsonl")
@@ -49,16 +69,19 @@ def main():
     start = min(target_times[0], reference_times[0]) // 1000 * 1000
     end = max(target_times[-1], reference_times[-1]) // 1000 * 1000 + 1000
     lags = []
+    phase_lags = {}
     with (args.out_dir / "progress.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["sample_ts_ms", "reference", "target", "reference_outputs",
+        writer.writerow(["sample_ts_ms", "phase", "reference", "target", "reference_outputs",
                          "target_outputs", "ordering_lag"])
         for sample in range(start, end + 1, 1000):
             ref_count = bisect_right(reference_times, sample)
             target_count = bisect_right(target_times, sample)
             lag = ref_count - target_count
             lags.append(lag)
-            writer.writerow([sample, args.reference, args.target, ref_count, target_count, lag])
+            phase_lags.setdefault(phase(sample), []).append(lag)
+            writer.writerow([sample, phase(sample), args.reference, args.target,
+                             ref_count, target_count, lag])
 
     attempts = []
     retries = 0
@@ -97,18 +120,22 @@ def main():
     repeats = Counter()
     with (args.out_dir / "attempts.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["attempt_id", "provider", "requester", "digest", "stage",
-                         "result", "bytes_read", "repeat_index"])
+        writer.writerow(["attempt_id", "ts_ms", "phase", "provider", "requester", "digest",
+                         "stage", "result", "bytes_read", "repeat_index"])
         for provider, event in attempts:
             key = (provider, event["requester"], event["digest"])
             repeats[key] += 1
             success = event["event"] == "BatchReadCompleted"
-            writer.writerow([f"{provider}:{event['seq']}", provider, event["requester"],
-                             event["digest"], "provider_read", "success" if success else "missing",
+            writer.writerow([f"{provider}:{event['seq']}", event["ts_ms"], phase(event["ts_ms"]),
+                             provider, event["requester"], event["digest"], "provider_read",
+                             "success" if success else "missing",
                              event["batch_size_bytes"] if success else "", repeats[key]])
 
     summary = {
         "scope": "target ordering and provider reads; no fault or recovery-time claim",
+        "warmup_completed_ms": warmup_completed,
+        "fault_started_ms": fault_started,
+        "fault_ended_ms": fault_ended,
         "target": args.target,
         "reference": args.reference,
         "target_outputs": len(target),
@@ -116,6 +143,11 @@ def main():
         "ordering_lag_min": min(lags),
         "ordering_lag_max": max(lags),
         "ordering_lag_p95": sorted(lags)[ceil(0.95 * len(lags)) - 1],
+        "ordering_lag_by_phase": {
+            name: {"samples": len(values), "max": max(values),
+                   "p95": sorted(values)[ceil(0.95 * len(values)) - 1]}
+            for name, values in phase_lags.items()
+        },
         "target_provider_read_attempts": len(attempts),
         "target_provider_read_successes": sum(
             event["event"] == "BatchReadCompleted" for _, event in attempts),
