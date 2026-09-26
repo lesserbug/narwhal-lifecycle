@@ -68,8 +68,9 @@ class LocalBench:
         except subprocess.SubprocessError as e:
             raise BenchError("Failed to kill testbed", e)
 
-    def run(self, debug=False):
+    def run(self, debug=False, trace=True):
         assert isinstance(debug, bool)
+        assert isinstance(trace, bool)
         Print.heading("Starting local benchmark")
 
         # Kill any previous testbed.
@@ -135,7 +136,7 @@ class LocalBench:
                     log_file,
                     env={
                         'NARWHAL_LIFECYCLE_TRACE': PathMaker.lifecycle_primary_trace_file(i),
-                    },
+                    } if trace else {'NARWHAL_LIFECYCLE_TRACE': ''},
                 )
 
             # Run the workers (except the faulty ones).
@@ -155,7 +156,7 @@ class LocalBench:
                         log_file,
                         env={
                             'NARWHAL_LIFECYCLE_TRACE': PathMaker.lifecycle_worker_trace_file(i, id),
-                        },
+                        } if trace else {'NARWHAL_LIFECYCLE_TRACE': ''},
                     )
 
             # Wait for all transactions to be processed.
@@ -164,8 +165,9 @@ class LocalBench:
             self._kill_nodes()
 
             # Build the offline shadow lifecycle view from passive traces.
-            Print.info("Analyzing lifecycle traces...")
-            self._run_shadow_analysis()
+            if trace:
+                Print.info("Analyzing lifecycle traces...")
+                self._run_shadow_analysis()
 
             # Parse logs and return the parser.
             Print.info("Parsing logs...")

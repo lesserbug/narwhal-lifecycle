@@ -2,6 +2,7 @@
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
+use lifecycle_trace::Event;
 use log::{error, warn};
 use network::SimpleSender;
 use store::Store;
@@ -61,8 +62,30 @@ impl Helper {
             // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
-                    Ok(None) => (),
+                    Ok(Some(data)) => {
+                        if lifecycle_trace::enabled() {
+                            lifecycle_trace::write(
+                                Event::new("worker", "BatchReadCompleted")
+                                    .str("source", "worker_helper")
+                                    .u64("worker_id", self.id as u64)
+                                    .str("requester", format!("{:?}", origin))
+                                    .str("digest", format!("{:?}", digest))
+                                    .usize("batch_size_bytes", data.len()),
+                            );
+                        }
+                        self.network.send(address, Bytes::from(data)).await;
+                    }
+                    Ok(None) => {
+                        if lifecycle_trace::enabled() {
+                            lifecycle_trace::write(
+                                Event::new("worker", "BatchReadMissing")
+                                    .str("source", "worker_helper")
+                                    .u64("worker_id", self.id as u64)
+                                    .str("requester", format!("{:?}", origin))
+                                    .str("digest", format!("{:?}", digest)),
+                            );
+                        }
+                    }
                     Err(e) => error!("{}", e),
                 }
             }
