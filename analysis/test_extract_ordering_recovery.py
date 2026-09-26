@@ -67,6 +67,8 @@ class ExtractOrderingRecoveryTests(unittest.TestCase):
 
     def test_cleanup_cancellation_is_not_resolution(self):
         write_events(self.traces / "worker-0-0.jsonl", [
+            {"event": "RepairWaiterCleared", "reason": "worker_sync",
+             "missing_digest": "Z", "clear_reason": "resolved"},
             {"event": "RepairWaiterAdded", "reason": "worker_sync", "missing_digest": "X"},
             {"event": "RepairWaiterRetried", "reason": "worker_sync", "missing_digest": "X"},
             {"event": "RepairWaiterCleared", "reason": "worker_sync",
@@ -78,6 +80,7 @@ class ExtractOrderingRecoveryTests(unittest.TestCase):
         self.assertEqual(summary["target_worker_sync_resolved"], 0)
         self.assertEqual(summary["target_worker_sync_cleanup_cancelled"], 1)
         self.assertEqual(summary["target_worker_sync_unresolved"], 1)
+        self.assertEqual(summary["target_worker_sync_unmatched_clears"], 1)
 
     def test_divergent_output_rejects_progress(self):
         write_events(self.traces / "primary-1.jsonl", [

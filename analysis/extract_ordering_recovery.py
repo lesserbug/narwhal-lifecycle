@@ -65,6 +65,8 @@ def main():
     waiter_added = 0
     waiter_resolved = 0
     waiter_cancelled = 0
+    unmatched_clears = 0
+    unmatched_retries = 0
     waiter_state = {}
     target_workers = args.target.replace("primary-", "worker-", 1) + "-"
     for path in sorted(args.trace_dir.glob("worker-*.jsonl")):
@@ -78,13 +80,19 @@ def main():
                     waiter_added += 1
                     waiter_state[key] = "active"
                 elif name == "RepairWaiterCleared":
-                    if event.get("clear_reason") == "resolved":
-                        waiter_resolved += 1
-                    elif event.get("clear_reason") == "cleanup_cancelled":
-                        waiter_cancelled += 1
-                    waiter_state[key] = event.get("clear_reason")
+                    if waiter_state.get(key) == "active":
+                        if event.get("clear_reason") == "resolved":
+                            waiter_resolved += 1
+                        elif event.get("clear_reason") == "cleanup_cancelled":
+                            waiter_cancelled += 1
+                        waiter_state[key] = event.get("clear_reason")
+                    else:
+                        unmatched_clears += 1
                 elif name == "RepairWaiterRetried":
-                    retries += 1
+                    if waiter_state.get(key) == "active":
+                        retries += 1
+                    else:
+                        unmatched_retries += 1
 
     repeats = Counter()
     with (args.out_dir / "attempts.csv").open("w", newline="", encoding="utf-8") as stream:
@@ -122,6 +130,8 @@ def main():
         "target_worker_sync_resolved": waiter_resolved,
         "target_worker_sync_unresolved": sum(value == "active" for value in waiter_state.values()),
         "target_worker_sync_cleanup_cancelled": waiter_cancelled,
+        "target_worker_sync_unmatched_clears": unmatched_clears,
+        "target_worker_sync_unmatched_retries": unmatched_retries,
     }
     (args.out_dir / "summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8")
