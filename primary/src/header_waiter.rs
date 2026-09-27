@@ -188,6 +188,23 @@ impl HeaderWaiter {
                                 let bytes = bincode::serialize(&message)
                                     .expect("Failed to serialize batch sync request");
                                 self.network.send(address, Bytes::from(bytes)).await;
+                                if lifecycle_trace::enabled() {
+                                    if let PrimaryWorkerMessage::Synchronize(digests, _) = &message {
+                                        for digest in digests {
+                                            lifecycle_trace::write(
+                                                Event::new("primary", "SyncDispatched")
+                                                    .str("source", "primary_header_waiter")
+                                                    .str("requesting_primary", format!("{:?}", self.name))
+                                                    .str("receiver_authority", format!("{:?}", author))
+                                                    .u64("worker_id", worker_id as u64)
+                                                    .str("provider_target", format!("{:?}", author))
+                                                    .str("header_digest", format!("{:?}", header_id))
+                                                    .str("digest", format!("{:?}", digest))
+                                                    .str("address", address.to_string()),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
 

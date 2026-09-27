@@ -115,6 +115,19 @@ impl Synchronizer {
                             .expect("Failed to measure time")
                             .as_millis();
 
+                        if lifecycle_trace::enabled() {
+                            for digest in &digests {
+                                lifecycle_trace::write(
+                                    Event::new("worker", "SyncReceived")
+                                        .str("source", "worker_synchronizer")
+                                        .str("receiving_authority", format!("{:?}", self.name))
+                                        .u64("worker_id", self.id as u64)
+                                        .str("provider_target", format!("{:?}", target))
+                                        .str("digest", format!("{:?}", digest)),
+                                );
+                            }
+                        }
+
                         let mut missing = Vec::new();
                         for digest in digests {
                             // Ensure we do not send twice the same sync request.
@@ -137,6 +150,17 @@ impl Synchronizer {
                                     error!("{}", e);
                                     continue;
                                 }
+                            }
+                            if lifecycle_trace::enabled() {
+                                lifecycle_trace::write(
+                                    Event::new("worker", "SyncStoreChecked")
+                                        .str("source", "worker_synchronizer")
+                                        .str("receiving_authority", format!("{:?}", self.name))
+                                        .u64("worker_id", self.id as u64)
+                                        .str("provider_target", format!("{:?}", target))
+                                        .str("digest", format!("{:?}", digest))
+                                        .str("result", if needs_sync { "miss" } else { "hit" }),
+                                );
                             }
 
                             // Add the digest to the waiter.

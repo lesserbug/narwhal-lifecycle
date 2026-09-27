@@ -53,8 +53,14 @@ def main():
     args = parser.parse_args()
     if args.fault_seconds < 0 or args.rate <= 0 or args.warmup_seconds < 30 or args.observe_seconds <= 0:
         parser.error("fault >= 0, rate > 0, warmup >= 30, and observation > 0 are required")
-    if not (BIN / "node").is_file() or not (BIN / "benchmark_client").is_file():
-        parser.error("build first: cargo build --release -p node --features benchmark")
+    build_command = ["cargo", "build", "--release", "-p", "node", "--features", "benchmark"]
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    git_status = subprocess.check_output(["git", "status", "--short"], cwd=ROOT, text=True).strip()
+    subprocess.run(build_command, cwd=ROOT, check=True)
+    binary_sha256 = {
+        name: hashlib.sha256((BIN / name).read_bytes()).hexdigest()
+        for name in ("node", "benchmark_client")
+    }
 
     out = args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -75,8 +81,11 @@ def main():
 
     config_hash = hashlib.sha256(committee_file.read_bytes() + parameters_file.read_bytes()).hexdigest()
     metadata = {
-        "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        "git_status": subprocess.check_output(["git", "status", "--short"], cwd=ROOT, text=True).strip(),
+        "revision": revision,
+        "git_status": git_status,
+        "build_command": build_command,
+        "build_features": ["benchmark"],
+        "binary_sha256": binary_sha256,
         "config_hash": config_hash,
         "topology": "4 primaries, 1 worker per primary, localhost",
         "target_role": "worker",
