@@ -19,6 +19,10 @@ use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
+#[cfg(test)]
+#[path = "tests/header_waiter_tests.rs"]
+mod header_waiter_tests;
+
 /// The resolution of the timer that checks whether we received replies to our sync requests, and triggers
 /// new sync requests if we didn't.
 const TIMER_RESOLUTION: u64 = 1_000;
@@ -180,9 +184,10 @@ impl HeaderWaiter {
                                 }
                             }
                             for (worker_id, digests) in requires_sync {
+                                let receiver_authority = self.name;
                                 let address = self.committee
-                                    .worker(&author, &worker_id)
-                                    .expect("Author of valid header is not in the committee")
+                                    .worker(&receiver_authority, &worker_id)
+                                    .expect("Local worker is not in the committee")
                                     .primary_to_worker;
                                 let message = PrimaryWorkerMessage::Synchronize(digests, author);
                                 let bytes = bincode::serialize(&message)
@@ -195,7 +200,7 @@ impl HeaderWaiter {
                                                 Event::new("primary", "SyncDispatched")
                                                     .str("source", "primary_header_waiter")
                                                     .str("requesting_primary", format!("{:?}", self.name))
-                                                    .str("receiver_authority", format!("{:?}", author))
+                                                    .str("receiver_authority", format!("{:?}", receiver_authority))
                                                     .u64("worker_id", worker_id as u64)
                                                     .str("provider_target", format!("{:?}", author))
                                                     .str("header_digest", format!("{:?}", header_id))
